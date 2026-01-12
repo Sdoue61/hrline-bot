@@ -8,17 +8,19 @@ CHANNEL_ACCESS_TOKEN = os.getenv("LINE_TOKEN")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
+    data = request.get_json(force=True)
 
-    if "events" in data:
-        for event in data["events"]:
-            if event["type"] == "message":
-                reply_token = event["replyToken"]
-                user_text = event["message"]["text"]
+    print(data)   # VERY IMPORTANT for debugging
 
-                reply(user_text, reply_token)
+    for event in data.get("events", []):
+        if event["type"] == "message":
+            reply_token = event["replyToken"]
+            user_text = event["message"]["text"]
 
-    return "OK"
+            reply(user_text, reply_token)
+
+    return "OK", 200
+
 
 def reply(text, token):
     url = "https://api.line.me/v2/bot/message/reply"
