@@ -8,18 +8,32 @@ CHANNEL_ACCESS_TOKEN = os.getenv("LINE_TOKEN")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json(force=True)
+    data = request.json
 
-    print(data)   # VERY IMPORTANT for debugging
+    if "events" in data:
+        for event in data["events"]:
 
-    for event in data.get("events", []):
-        if event["type"] == "message":
-            reply_token = event["replyToken"]
+            # Only process messages
+            if event["type"] != "message":
+                continue
+
+            source = event["source"]["type"]  # "user", "group", "room"
             user_text = event["message"]["text"]
 
+            # --- GROUP FILTER ---
+            if source != "user":
+                # Only allow if message starts with !hr
+                if not user_text.lower().startswith("!hr"):
+                    return "OK"
+
+                # Remove the !hr part
+                user_text = user_text[3:].strip()
+
+            reply_token = event["replyToken"]
             reply(user_text, reply_token)
 
-    return "OK", 200
+    return "OK"
+
 
 
 def reply(text, token):
