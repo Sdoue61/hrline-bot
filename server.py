@@ -52,8 +52,17 @@ def find_faq(text):
     lang = detect_language(text)
 
     for item in FAQ:
-        if item["key"] in t or item[f"{lang}_q"] in t:
+        # allow multiple keywords in key column
+        keys = [k.strip() for k in item["key"].split(",")]
+
+        for k in keys:
+            if k and k in t:
+                return item[f"{lang}_a"]
+
+        # fallback to full question match
+        if item[f"{lang}_q"] and item[f"{lang}_q"] in t:
             return item[f"{lang}_a"]
+
     return None
 
 # -------------------------------
