@@ -38,7 +38,12 @@ def load_faq():
             })
     return faq
 
-FAQ = load_faq()
+# Don't crash the whole bot if FAQ load fails
+try:
+    FAQ = load_faq()
+except Exception as e:
+    print("FAQ load failed:", e, flush=True)
+    FAQ = []
 
 # -------------------------------
 # Helper functions (FAQ)
@@ -52,14 +57,12 @@ def find_faq(text):
     lang = detect_language(text)
 
     for item in FAQ:
-        # allow multiple keywords in key column
         keys = [k.strip() for k in item["key"].split(",")]
 
         for k in keys:
             if k and k in t:
                 return item[f"{lang}_a"]
 
-        # fallback to full question match
         if item[f"{lang}_q"] and item[f"{lang}_q"] in t:
             return item[f"{lang}_a"]
 
@@ -69,8 +72,6 @@ def find_faq(text):
 # Quitting date flow (MVP state)
 # -------------------------------
 
-# In-memory state: { user_id: {"step": "...", "staff_id": "..."} }
-# NOTE: resets on deploy/restart. Good enough for MVP.
 USER_STATE = {}
 
 def is_quit_trigger(text: str) -> bool:
@@ -85,7 +86,7 @@ def call_apps_script_quitting(line_user_id: str, staff_id: str, quitting_date: s
     api_key = os.environ.get("APPS_SCRIPT_API_KEY")
 
     if not url or not api_key:
-        print("Missing APPS_SCRIPT_URL or APPS_SCRIPT_API_KEY")
+        print("Missing APPS_SCRIPT_URL or APPS_SCRIPT_API_KEY", flush=True)
         return {"ok": False, "error": "MISSING_ENV"}
 
     payload = {
@@ -104,16 +105,19 @@ def call_apps_script_quitting(line_user_id: str, staff_id: str, quitting_date: s
             json=payload,
             timeout=10,
         )
+
+        print("AppsScript status:", r.status_code, flush=True)
+        print("AppsScript raw:", (r.text or "")[:500], flush=True)
+
         try:
-            return r.json()
+            j = r.json()
+            print("AppsScript json:", j, flush=True)
+            return j
         except Exception:
-            return {
-                "ok": False,
-                "error": "NON_JSON",
-                "status": r.status_code,
-                "text": r.text[:200],
-            }
+            return {"ok": False, "error": "NON_JSON", "status": r.status_code, "text": (r.text or "")[:200]}
+
     except Exception as e:
+        print("AppsScript request failed:", str(e), flush=True)
         return {"ok": False, "error": "REQUEST_FAILED", "detail": str(e)}
 
 # -------------------------------
@@ -150,7 +154,7 @@ def webhook():
             continue
 
         source_type = event.get("source", {}).get("type")
-        user_id = event.get("source", {}).get("userId")  # needed for state + Apps Script
+        user_id = event.get("source", {}).get("userId")
         user_text = (event.get("message", {}).get("text") or "").strip()
         reply_token = event.get("replyToken")
 
@@ -161,7 +165,7 @@ def webhook():
         if source_type != "user":
             if not user_text.lower().startswith("!hr"):
                 continue
-            user_text = user_text[3:].strip()  # remove "!hr"
+            user_text = user_text[3:].strip()
 
         # --- Quitting flow start ---
         if user_id and is_quit_trigger(user_text):
@@ -180,7 +184,6 @@ def webhook():
             if st.get("step") == "WAIT_STAFFID":
                 staff_id = user_text
 
-                # Basic StaffID format check (adjust if needed)
                 if not re.match(r"^\d{3,6}$", staff_id):
                     reply(
                         "社員番号の形式が正しくありません。例：2338\n\n"
@@ -209,14 +212,14 @@ def webhook():
                     )
                     continue
 
+                # ✅ CALL Apps Script here
                 result = call_apps_script_quitting(
                     line_user_id=user_id,
                     staff_id=st.get("staff_id", ""),
                     quitting_date=quitting_date
                 )
-                print("Apps Script result:", result)
 
-                # Clear state regardless (avoid trapping user)
+                # Clear state regardless
                 USER_STATE.pop(user_id, None)
 
                 if result.get("ok"):
