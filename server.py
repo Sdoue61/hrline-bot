@@ -16,7 +16,7 @@ creds = service_account.Credentials.from_service_account_file(KEY_PATH, scopes=S
 sheets = build("sheets", "v4", credentials=creds)
 
 SHEET_ID = "12TV6k9J7Icm_2P3IKFPEMJxMVpYhvE1IDgXexwt4jfY"
-RANGE = "FAQ!A:E"
+RANGE = "'FAQ'!A:E"
 
 def load_faq():
     result = sheets.spreadsheets().values().get(
