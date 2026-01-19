@@ -30,19 +30,18 @@ def load_faq():
     for row in rows[1:]:
         if len(row) >= 5:
             faq.append({
-                "key": row[0].lower().strip(),
-                "en_q": row[1].lower().strip(),
-                "en_a": row[2].strip(),
-                "jp_q": row[3].strip(),
-                "jp_a": row[4].strip()
+                "key": (row[0] or "").lower().strip(),
+                "en_q": (row[1] or "").lower().strip(),
+                "en_a": (row[2] or "").strip(),
+                "jp_q": (row[3] or "").strip(),
+                "jp_a": (row[4] or "").strip()
             })
     return faq
 
-# Don't crash the whole bot if FAQ load fails
 try:
     FAQ = load_faq()
 except Exception as e:
-    print("FAQ load failed:", e, flush=True)
+    print("FAQ load failed:", str(e), flush=True)
     FAQ = []
 
 # -------------------------------
@@ -50,43 +49,48 @@ except Exception as e:
 # -------------------------------
 
 def detect_language(text):
-    return "jp" if re.search("[ぁ-んァ-ン一-龯]", text) else "en"
+    return "jp" if re.search("[ぁ-んァ-ン一-龯]", text or "") else "en"
 
 def find_faq(text):
-    t = text.lower()
+    t = (text or "").lower()
     lang = detect_language(text)
 
     for item in FAQ:
-        keys = [k.strip() for k in item["key"].split(",")]
+        keys = [k.strip() for k in (item.get("key") or "").split(",")]
 
         for k in keys:
             if k and k in t:
-                return item[f"{lang}_a"]
+                return item.get(f"{lang}_a")
 
-        if item[f"{lang}_q"] and item[f"{lang}_q"] in t:
-            return item[f"{lang}_a"]
+        q = (item.get(f"{lang}_q") or "").lower().strip()
+        if q and q in t:
+            return item.get(f"{lang}_a")
 
     return None
 
 # -------------------------------
-# Quitting date flow (MVP state)
+# Quitting date flow (state)
 # -------------------------------
 
 USER_STATE = {}
 
-def is_quit_trigger(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return t in ["quit", "resign", "退職", "辞める", "退会", "やめる"]
+def is_quit_trigger(text):
+    return (text or "").strip().lower() in [
+        "quit", "resign", "退職", "辞める", "退会", "やめる"
+    ]
 
-def is_valid_iso_date(s: str) -> bool:
-    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", (s or "").strip()))
+def is_valid_iso_date(s):
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", s or ""))
 
-def call_apps_script_quitting(line_user_id: str, staff_id: str, quitting_date: str) -> dict:
-    url = os.environ.get("APPS_SCRIPT_URL")
-    api_key = os.environ.get("APPS_SCRIPT_API_KEY")
+# -------------------------------
+# Call Apps Script (URL-only auth)
+# -------------------------------
 
-    if not url or not api_key:
-        print("Missing APPS_SCRIPT_URL or APPS_SCRIPT_API_KEY", flush=True)
+def call_apps_script_quitting(line_user_id, staff_id, quitting_date):
+    url = os.environ.get("APPS_SCRIPT_URL", "").strip()
+
+    if not url:
+        print("Missing APPS_SCRIPT_URL", flush=True)
         return {"ok": False, "error": "MISSING_ENV"}
 
     payload = {
@@ -101,20 +105,23 @@ def call_apps_script_quitting(line_user_id: str, staff_id: str, quitting_date: s
     try:
         r = requests.post(
             url,
-            headers={"Content-Type": "application/json", "X-API-KEY": api_key},
+            headers={"Content-Type": "application/json"},
             json=payload,
-            timeout=10,
+            timeout=15,
         )
 
         print("AppsScript status:", r.status_code, flush=True)
         print("AppsScript raw:", (r.text or "")[:500], flush=True)
 
         try:
-            j = r.json()
-            print("AppsScript json:", j, flush=True)
-            return j
+            return r.json()
         except Exception:
-            return {"ok": False, "error": "NON_JSON", "status": r.status_code, "text": (r.text or "")[:200]}
+            return {
+                "ok": False,
+                "error": "NON_JSON",
+                "status": r.status_code,
+                "text": (r.text or "")[:200],
+            }
 
     except Exception as e:
         print("AppsScript request failed:", str(e), flush=True)
@@ -125,9 +132,13 @@ def call_apps_script_quitting(line_user_id: str, staff_id: str, quitting_date: s
 # -------------------------------
 
 app = Flask(__name__)
-CHANNEL_ACCESS_TOKEN = os.getenv("LINE_TOKEN")
+CHANNEL_ACCESS_TOKEN = os.getenv("LINE_TOKEN", "").strip()
 
 def reply(text, token):
+    if not CHANNEL_ACCESS_TOKEN:
+        print("Missing LINE_TOKEN", flush=True)
+        return
+
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
         "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
@@ -161,13 +172,13 @@ def webhook():
         if not reply_token or not user_text:
             continue
 
-        # Group protection: only respond if starts with !hr
+        # Group protection
         if source_type != "user":
             if not user_text.lower().startswith("!hr"):
                 continue
             user_text = user_text[3:].strip()
 
-        # --- Quitting flow start ---
+        # ---- Quit flow start ----
         if user_id and is_quit_trigger(user_text):
             USER_STATE[user_id] = {"step": "WAIT_STAFFID"}
             reply(
@@ -177,80 +188,65 @@ def webhook():
             )
             continue
 
-        # --- Quitting flow continue ---
+        # ---- Quit flow continue ----
         if user_id and user_id in USER_STATE:
             st = USER_STATE[user_id]
 
-            if st.get("step") == "WAIT_STAFFID":
-                staff_id = user_text
-
-                if not re.match(r"^\d{3,6}$", staff_id):
-                    reply(
-                        "社員番号の形式が正しくありません。例：2338\n\n"
-                        "Staff ID format looks wrong. Example: 2338.",
-                        reply_token
-                    )
+            if st["step"] == "WAIT_STAFFID":
+                if not re.match(r"^\d{3,6}$", user_text):
+                    reply("社員番号の形式が正しくありません。例：2338", reply_token)
                     continue
 
-                st["staff_id"] = staff_id
+                st["staff_id"] = user_text
                 st["step"] = "WAIT_DATE"
                 reply(
-                    "退職希望日（最後の勤務日）を入力してください。\n形式：YYYY-MM-DD\n例：2026-03-31\n\n"
-                    "Please enter quitting date (last working day).\nFormat: YYYY-MM-DD\nExample: 2026-03-31",
+                    "退職希望日を入力してください。\n形式：YYYY-MM-DD\n例：2026-03-31",
                     reply_token
                 )
                 continue
 
-            if st.get("step") == "WAIT_DATE":
-                quitting_date = user_text
-
-                if not is_valid_iso_date(quitting_date):
-                    reply(
-                        "日付の形式が正しくありません。例：2026-03-31\n\n"
-                        "Invalid date format. Example: 2026-03-31",
-                        reply_token
-                    )
+            if st["step"] == "WAIT_DATE":
+                if not is_valid_iso_date(user_text):
+                    reply("日付形式が正しくありません。例：2026-03-31", reply_token)
                     continue
 
-                # ✅ CALL Apps Script here
                 result = call_apps_script_quitting(
-                    line_user_id=user_id,
-                    staff_id=st.get("staff_id", ""),
-                    quitting_date=quitting_date
+                    user_id,
+                    st["staff_id"],
+                    user_text
                 )
 
-                # Clear state regardless
                 USER_STATE.pop(user_id, None)
 
                 if result.get("ok"):
                     reply(
-                        "申請を受け付けました。内容を確認のうえ、HRよりご連絡します。\n\n"
-                        "Your request has been received. HR will review and contact you.",
+                        "申請を受け付けました。HRよりご連絡します。",
                         reply_token
                     )
                 else:
+                    print("Quitting error:", result, flush=True)
                     reply(
-                        "申請は受け付けましたが、システム登録でエラーが発生しました。HRへご連絡ください。\n\n"
-                        "Your request was received, but there was a system error saving it. Please contact HR.",
+                        "システムエラーが発生しました。HRへご連絡ください。",
                         reply_token
                     )
                 continue
 
-        # --- FAQ flow (default) ---
+        # ---- FAQ ----
         answer = find_faq(user_text)
-
         if answer:
             reply(answer, reply_token)
         else:
-            if detect_language(user_text) == "jp":
-                reply("申し訳ありません。その質問は人事に転送されました。", reply_token)
-            else:
-                reply("Sorry, HR will follow up on this.", reply_token)
+            reply(
+                "申し訳ありません。その質問は人事に転送されました。"
+                if detect_language(user_text) == "jp"
+                else "Sorry, HR will follow up on this.",
+                reply_token
+            )
 
     return "OK"
 
 # -------------------------------
-# Run server (local dev only)
+# Local dev only
 # -------------------------------
 
 if __name__ == "__main__":
