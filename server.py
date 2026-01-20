@@ -206,6 +206,7 @@ def webhook():
 
         source_type = event.get("source", {}).get("type")
         user_id = event.get("source", {}).get("userId")
+        print("LINE userId =", user_id, flush=True)
         user_text_raw = (event.get("message", {}).get("text") or "")
         user_text = user_text_raw.strip()
         reply_token = event.get("replyToken")
