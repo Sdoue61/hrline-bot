@@ -74,10 +74,7 @@ def line_reply(reply_token: str, messages: list):
         print("Missing LINE_TOKEN", flush=True)
         return
     url = "https://api.line.me/v2/bot/message/reply"
-    headers = {
-        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
     data = {"replyToken": reply_token, "messages": messages}
     try:
         requests.post(url, headers=headers, json=data, timeout=10)
@@ -88,9 +85,6 @@ def reply_text(reply_token: str, text: str):
     line_reply(reply_token, [{"type": "text", "text": text}])
 
 def reply_text_quick(reply_token: str, text: str, options: list):
-    """
-    options: list of button labels (same label is sent back as text)
-    """
     items = [{"type": "action", "action": {"type": "message", "label": opt, "text": opt}} for opt in options]
     line_reply(reply_token, [{
         "type": "text",
@@ -121,7 +115,7 @@ def call_apps_script(payload: dict) -> dict:
         return {"ok": False, "error": "REQUEST_FAILED", "detail": str(e)}
 
 # -------------------------------
-# Quitting flow state
+# Quitting flow state (MVP in-memory)
 # -------------------------------
 
 USER_STATE = {}
@@ -130,13 +124,9 @@ def is_quit_trigger(text: str) -> bool:
     t = (text or "").strip().lower()
     return t in ["quit", "resign", "退職", "辞める", "やめる"]
 
-def is_cancel_flow_trigger(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return t in ["退職申請キャンセル", "退職キャンセル", "cancel quit", "cancel quit request"]
-
 def is_cancel_word(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in ["cancel", "キャンセル", "中止", "やめる"]
+    return t in ["cancel", "キャンセル", "中止"]
 
 def is_valid_staff_id(text: str) -> bool:
     return bool(re.match(r"^\d{3,6}$", (text or "").strip()))
@@ -144,51 +134,17 @@ def is_valid_staff_id(text: str) -> bool:
 def is_valid_iso_date(text: str) -> bool:
     return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", (text or "").strip()))
 
-REASON_JP = [
-    "転職（Job change）",
-    "家庭都合（Family）",
-    "学業（Study）",
-    "健康（Health）",
-    "契約満了（End of contract）",
-    "その他（Other）",
+# Quick Reply reasons (JP label + EN meaning)
+REASON_CHOICES = [
+    ("転職（Job change）", "Job change"),
+    ("家庭都合（Family）", "Family reasons"),
+    ("学業（Study）", "Study"),
+    ("健康（Health）", "Health"),
+    ("契約満了（End of contract）", "End of contract"),
+    ("その他（Other）", "Other"),
 ]
-REASON_MAP = {
-    "転職（Job change）": "Job change",
-    "家庭都合（Family）": "Family reasons",
-    "学業（Study）": "Study",
-    "健康（Health）": "Health",
-    "契約満了（End of contract）": "End of contract",
-    "その他（Other）": "Other",
-}
-
-# -------------------------------
-# HR command security
-# -------------------------------
-
-def is_hr_user(line_user_id: str) -> bool:
-    allow = os.getenv("HR_LINE_USER_IDS", "").strip()
-    if not allow:
-        # If you don't set HR_LINE_USER_IDS, HR commands are disabled for safety.
-        return False
-    allowed_ids = [x.strip() for x in allow.split(",") if x.strip()]
-    return line_user_id in allowed_ids
-
-def parse_hr_command(text: str):
-    # Expected: approve <requestId> [comment...]
-    #           reject <requestId> [comment...]
-    #           cancel <requestId> [comment...]
-    t = (text or "").strip()
-    parts = t.split()
-    if len(parts) < 2:
-        return None
-    cmd = parts[0].lower()
-    req_id = parts[1].strip()
-    comment = " ".join(parts[2:]).strip()
-    if cmd not in ["approve", "reject", "cancel"]:
-        return None
-    if not req_id:
-        return None
-    return cmd, req_id, comment
+REASON_LABELS = [x[0] for x in REASON_CHOICES]
+REASON_MAP = {jp: en for (jp, en) in REASON_CHOICES}
 
 # -------------------------------
 # Webhook
@@ -206,9 +162,7 @@ def webhook():
 
         source_type = event.get("source", {}).get("type")
         user_id = event.get("source", {}).get("userId")
-        print("LINE userId =", user_id, flush=True)
-        user_text_raw = (event.get("message", {}).get("text") or "")
-        user_text = user_text_raw.strip()
+        user_text = (event.get("message", {}).get("text") or "").strip()
         reply_token = event.get("replyToken")
 
         if not reply_token or not user_text:
@@ -220,109 +174,41 @@ def webhook():
                 continue
             user_text = user_text[3:].strip()
 
-        # ---- Global cancel word during any active state ----
+        # Cancel during active flow
         if user_id and user_id in USER_STATE and is_cancel_word(user_text):
             USER_STATE.pop(user_id, None)
             reply_text(reply_token, "キャンセルしました。\nCancelled.")
             continue
 
-        # ---- HR commands (only for allowed HR users) ----
-        if user_text.lower().startswith(("approve ", "reject ", "cancel ")):
-            if not user_id or not is_hr_user(user_id):
-                reply_text(reply_token, "権限がありません（HRのみ）。\nNot authorized (HR only).")
-                continue
-
-            parsed = parse_hr_command(user_text)
-            if not parsed:
-                reply_text(reply_token,
-                           "コマンド形式：\napprove <RequestID>\nreject <RequestID> <comment>\ncancel <RequestID> <comment>")
-                continue
-
-            cmd, req_id, comment = parsed
-            action_map = {
-                "approve": "approveQuittingRequest",
-                "reject": "rejectQuittingRequest",
-                "cancel": "cancelRequestById",
-            }
-            payload = {
-                "action": action_map[cmd],
-                "requestId": req_id,
-                "hrLineUserId": user_id,
-                "hrComment": comment,
-            }
-            result = call_apps_script(payload)
-            if result.get("ok"):
-                reply_text(reply_token, f"OK: {cmd} {req_id}")
-            else:
-                reply_text(reply_token, f"NG: {result.get('error')}\n{result.get('detail','')}")
-            continue
-
-        # ---- Cancel latest quitting request command (staff) ----
-        if user_id and is_cancel_flow_trigger(user_text):
-            USER_STATE[user_id] = {"step": "CANCEL_WAIT_STAFFID"}
-            reply_text(reply_token, "退職申請のキャンセルをします。\n社員番号（例：2338）を入力してください。")
-            continue
-
-        if user_id and user_id in USER_STATE and USER_STATE[user_id].get("step") == "CANCEL_WAIT_STAFFID":
-            if not is_valid_staff_id(user_text):
-                reply_text(reply_token, "社員番号の形式が正しくありません。例：2338")
-                continue
-            USER_STATE[user_id]["staff_id"] = user_text
-            USER_STATE[user_id]["step"] = "CANCEL_CONFIRM"
-            reply_text_quick(reply_token,
-                             "最新の退職申請（New/InReview）をキャンセルしますか？",
-                             ["はい（Yes）", "いいえ（No）"])
-            continue
-
-        if user_id and user_id in USER_STATE and USER_STATE[user_id].get("step") == "CANCEL_CONFIRM":
-            if user_text not in ["はい（Yes）", "いいえ（No）"]:
-                reply_text(reply_token, "ボタンから選択してください。")
-                continue
-            if user_text == "いいえ（No）":
-                USER_STATE.pop(user_id, None)
-                reply_text(reply_token, "キャンセルしませんでした。\nNo changes made.")
-                continue
-
-            staff_id = USER_STATE[user_id].get("staff_id", "")
-            USER_STATE.pop(user_id, None)
-
-            payload = {
-                "action": "cancelLatestQuittingRequest",
-                "lineUserId": user_id,
-                "staffId": staff_id,
-                "hrComment": "Cancelled by staff via LINE",
-            }
-            result = call_apps_script(payload)
-            if result.get("ok"):
-                reply_text(reply_token, "最新の退職申請をキャンセルしました。\nCancelled your latest quitting request.")
-            else:
-                reply_text(reply_token, "キャンセルに失敗しました。HRへご連絡ください。\nFailed. Please contact HR.")
-            continue
-
         # ---- Start quitting flow ----
         if user_id and is_quit_trigger(user_text):
             USER_STATE[user_id] = {"step": "Q_WAIT_STAFFID"}
-            reply_text(reply_token,
-                       "退職日申請を開始します。\n社員番号（例：2338）を入力してください。\n\n"
-                       "Starting quitting date request.\nPlease enter your Staff ID (e.g., 2338).")
+            reply_text(
+                reply_token,
+                "退職日申請を開始します。\n社員番号（例：2338）を入力してください。\n\n"
+                "Starting quitting date request.\nPlease enter your Staff ID (e.g., 2338)."
+            )
             continue
 
         # ---- Continue quitting flow ----
         if user_id and user_id in USER_STATE:
             st = USER_STATE[user_id]
+            step = st.get("step")
 
-            if st.get("step") == "Q_WAIT_STAFFID":
+            if step == "Q_WAIT_STAFFID":
                 if not is_valid_staff_id(user_text):
                     reply_text(reply_token, "社員番号の形式が正しくありません。例：2338\n\nStaff ID example: 2338")
                     continue
                 st["staff_id"] = user_text
                 st["step"] = "Q_WAIT_DATE"
-                reply_text(reply_token,
-                           "退職希望日（最後の勤務日）を入力してください。\n形式：YYYY-MM-DD\n例：2026-03-31\n\n"
-                           "Enter quitting date.\nFormat: YYYY-MM-DD (e.g., 2026-03-31)")
+                reply_text(
+                    reply_token,
+                    "退職希望日（最後の勤務日）を入力してください。\n形式：YYYY-MM-DD\n例：2026-03-31\n\n"
+                    "Enter quitting date.\nFormat: YYYY-MM-DD (e.g., 2026-03-31)"
+                )
                 continue
 
-            if st.get("step") == "Q_WAIT_DATE":
+            if step == "Q_WAIT_DATE":
                 if not is_valid_iso_date(user_text):
                     reply_text(reply_token, "日付形式が正しくありません。例：2026-03-31\n\nExample: 2026-03-31")
                     continue
@@ -331,28 +217,30 @@ def webhook():
                 reply_text_quick(
                     reply_token,
                     "退職理由を選んでください（Choose a reason）",
-                    REASON_JP + ["キャンセル（Cancel）"]
+                    REASON_LABELS + ["キャンセル（Cancel）"]
                 )
                 continue
 
-            if st.get("step") == "Q_WAIT_REASON":
+            if step == "Q_WAIT_REASON":
                 if user_text == "キャンセル（Cancel）" or is_cancel_word(user_text):
                     USER_STATE.pop(user_id, None)
                     reply_text(reply_token, "キャンセルしました。\nCancelled.")
                     continue
 
                 if user_text not in REASON_MAP:
-                    reply_text(reply_token, "ボタンから選択してください。")
+                    reply_text(reply_token, "ボタンから選択してください。\nPlease choose using the buttons.")
                     continue
 
-                reason = REASON_MAP[user_text]
-                st["reason"] = reason
+                st["reason"] = REASON_MAP[user_text]
 
-                if reason == "Other":
+                # If Other → ask optional comment
+                if st["reason"] == "Other":
                     st["step"] = "Q_WAIT_COMMENT"
-                    reply_text(reply_token,
-                               "補足コメントがあれば入力してください（なければ「なし」）。\n\n"
-                               "Optional comment (or type 'none').")
+                    reply_text(
+                        reply_token,
+                        "補足コメントがあれば入力してください（なければ「なし」）。\n\n"
+                        "Optional comment (or type 'none')."
+                    )
                 else:
                     st["comment"] = ""
                     st["step"] = "Q_CONFIRM"
@@ -363,8 +251,8 @@ def webhook():
                     )
                 continue
 
-            if st.get("step") == "Q_WAIT_COMMENT":
-                comment = user_text
+            if step == "Q_WAIT_COMMENT":
+                comment = user_text.strip()
                 if comment.lower() in ["none", "なし", "無し", "no"]:
                     comment = ""
                 st["comment"] = comment
@@ -376,13 +264,13 @@ def webhook():
                 )
                 continue
 
-            if st.get("step") == "Q_CONFIRM":
+            if step == "Q_CONFIRM":
                 if user_text == "キャンセル（Cancel）" or is_cancel_word(user_text):
                     USER_STATE.pop(user_id, None)
                     reply_text(reply_token, "キャンセルしました。\nCancelled.")
                     continue
                 if user_text != "送信（Submit）":
-                    reply_text(reply_token, "ボタンから選択してください。")
+                    reply_text(reply_token, "ボタンから選択してください。\nPlease choose using the buttons.")
                     continue
 
                 payload = {
@@ -398,14 +286,18 @@ def webhook():
 
                 if result.get("ok"):
                     rid = result.get("requestId", "")
-                    reply_text(reply_token,
-                               f"申請を受け付けました。HRよりご連絡します。\n受付番号: {rid}\n\n"
-                               "Your request has been received. HR will review and contact you.")
+                    reply_text(
+                        reply_token,
+                        f"申請を受け付けました。HRよりご連絡します。\n受付番号: {rid}\n\n"
+                        "Your request has been received. HR will review and contact you."
+                    )
                 else:
                     print("Quitting error:", result, flush=True)
-                    reply_text(reply_token,
-                               "システム登録でエラーが発生しました。HRへご連絡ください。\n\n"
-                               "System error saving it. Please contact HR.")
+                    reply_text(
+                        reply_token,
+                        "システム登録でエラーが発生しました。HRへご連絡ください。\n\n"
+                        "System error saving it. Please contact HR."
+                    )
                 continue
 
         # ---- FAQ fallback ----
