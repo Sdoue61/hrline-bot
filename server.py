@@ -5,9 +5,9 @@ import re
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# -------------------------------
+# =========================================================
 # Google Sheets setup (FAQ)
-# -------------------------------
+# =========================================================
 
 KEY_PATH = "/etc/secrets/google-creds.json"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
@@ -19,9 +19,14 @@ SHEET_ID = "12TV6k9J7Icm_2P3IKFPEMJxMVpYhvE1IDgXexwt4jfY"
 RANGE = "'FAQ'!A:E"
 
 def load_faq():
-    result = sheets.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=RANGE).execute()
+    result = sheets.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=RANGE
+    ).execute()
+
     rows = result.get("values", [])
     faq = []
+
     for row in rows[1:]:
         if len(row) >= 5:
             faq.append({
@@ -36,119 +41,157 @@ def load_faq():
 try:
     FAQ = load_faq()
 except Exception as e:
-    print("FAQ load failed:", str(e), flush=True)
+    print("FAQ load failed:", e, flush=True)
     FAQ = []
 
-# -------------------------------
-# FAQ helpers
-# -------------------------------
-
 def detect_language(text: str) -> str:
-    return "jp" if re.search("[ぁ-んァ-ン一-龯]", text or "") else "en"
+    return "jp" if re.search(r"[ぁ-んァ-ン一-龯]", text or "") else "en"
 
 def find_faq(text: str):
     t = (text or "").lower()
     lang = detect_language(text)
 
     for item in FAQ:
-        keys = [k.strip() for k in (item.get("key") or "").split(",")]
+        keys = [k.strip() for k in item.get("key", "").split(",")]
         for k in keys:
             if k and k in t:
                 return item.get(f"{lang}_a")
 
-        q = (item.get(f"{lang}_q") or "").lower().strip()
+        q = (item.get(f"{lang}_q") or "").lower()
         if q and q in t:
             return item.get(f"{lang}_a")
 
     return None
 
-# -------------------------------
-# LINE setup
-# -------------------------------
-
-app = Flask(__name__)
-CHANNEL_ACCESS_TOKEN = os.getenv("LINE_TOKEN", "").strip()
-
-def line_reply(reply_token: str, messages: list):
-    if not CHANNEL_ACCESS_TOKEN:
-        print("Missing LINE_TOKEN", flush=True)
-        return
-    url = "https://api.line.me/v2/bot/message/reply"
-    headers = {"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}", "Content-Type": "application/json"}
-    data = {"replyToken": reply_token, "messages": messages}
-    try:
-        requests.post(url, headers=headers, json=data, timeout=10)
-    except Exception as e:
-        print("LINE reply failed:", str(e), flush=True)
-
-def reply_text(reply_token: str, text: str):
-    line_reply(reply_token, [{"type": "text", "text": text}])
-
-def reply_text_quick(reply_token: str, text: str, options: list):
-    items = [{"type": "action", "action": {"type": "message", "label": opt, "text": opt}} for opt in options]
-    line_reply(reply_token, [{
-        "type": "text",
-        "text": text,
-        "quickReply": {"items": items}
-    }])
-
-# -------------------------------
-# Apps Script call (URL auth)
-# -------------------------------
-
-def call_apps_script(payload: dict) -> dict:
-    url = os.environ.get("APPS_SCRIPT_URL", "").strip()
-    if not url:
-        print("Missing APPS_SCRIPT_URL", flush=True)
-        return {"ok": False, "error": "MISSING_ENV"}
-
-    try:
-        r = requests.post(url, headers={"Content-Type": "application/json"}, json=payload, timeout=20)
-        print("AppsScript status:", r.status_code, flush=True)
-        print("AppsScript raw:", (r.text or "")[:500], flush=True)
-        try:
-            return r.json()
-        except Exception:
-            return {"ok": False, "error": "NON_JSON", "text": (r.text or "")[:200]}
-    except Exception as e:
-        print("AppsScript request failed:", str(e), flush=True)
-        return {"ok": False, "error": "REQUEST_FAILED", "detail": str(e)}
-
-# -------------------------------
-# Quitting flow state (MVP in-memory)
-# -------------------------------
+# =========================================================
+# Quitting flow state (in-memory MVP)
+# =========================================================
 
 USER_STATE = {}
 
 def is_quit_trigger(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in ["quit", "resign", "退職", "辞める", "やめる"]
+    return t in ["quit", "resign", "退職", "辞める", "辞めたい", "やめる", "退会"]
 
-def is_cancel_word(text: str) -> bool:
+def is_cancel_trigger(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in ["cancel", "キャンセル", "中止"]
+    return t in ["cancel", "cancel quit", "キャンセル", "取消", "取り消し", "中止"]
 
-def is_valid_staff_id(text: str) -> bool:
-    return bool(re.match(r"^\d{3,6}$", (text or "").strip()))
+def is_valid_iso_date(s: str) -> bool:
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", (s or "").strip()))
 
-def is_valid_iso_date(text: str) -> bool:
-    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", (text or "").strip()))
-
-# Quick Reply reasons (JP label + EN meaning)
-REASON_CHOICES = [
-    ("転職（Job change）", "Job change"),
-    ("家庭都合（Family）", "Family reasons"),
-    ("学業（Study）", "Study"),
-    ("健康（Health）", "Health"),
-    ("契約満了（End of contract）", "End of contract"),
-    ("その他（Other）", "Other"),
+REASONS = [
+    ("家庭の事情", "Family reasons"),
+    ("健康上の理由", "Health reasons"),
+    ("引っ越し", "Moving"),
+    ("学業・進学", "School / Study"),
+    ("転職", "New job"),
+    ("その他", "Other"),
 ]
-REASON_LABELS = [x[0] for x in REASON_CHOICES]
-REASON_MAP = {jp: en for (jp, en) in REASON_CHOICES}
+VALID_REASON_JP = {jp for jp, _ in REASONS}
+REASON_NUM_MAP = {str(i+1): REASONS[i][0] for i in range(len(REASONS))}
 
-# -------------------------------
+def call_apps_script_quitting(line_user_id: str, staff_id: str, quitting_date: str, reason: str, comment: str) -> dict:
+    url = os.environ.get("APPS_SCRIPT_URL")
+    api_key = os.environ.get("APPS_SCRIPT_API_KEY")
+
+    if not url or not api_key:
+        print("Missing APPS_SCRIPT_URL or APPS_SCRIPT_API_KEY", flush=True)
+        return {"ok": False, "error": "MISSING_ENV"}
+
+    payload = {
+        "action": "createQuittingRequest",
+        "lineUserId": line_user_id,
+        "staffId": staff_id,
+        "quittingDate": quitting_date,
+        "reason": reason or "",
+        "comment": comment or "",
+    }
+
+    try:
+        r = requests.post(
+            url,
+            headers={"Content-Type": "application/json", "X-API-KEY": api_key},
+            json=payload,
+            timeout=15,
+        )
+        print("AppsScript status:", r.status_code, flush=True)
+        print("AppsScript raw:", (r.text or "")[:500], flush=True)
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": False, "error": "NON_JSON", "status": r.status_code, "text": (r.text or "")[:200]}
+    except Exception as e:
+        print("AppsScript request failed:", str(e), flush=True)
+        return {"ok": False, "error": "REQUEST_FAILED", "detail": str(e)}
+
+# =========================================================
+# LINE Messaging helpers
+# =========================================================
+
+app = Flask(__name__)
+CHANNEL_ACCESS_TOKEN = os.getenv("LINE_TOKEN") or os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+
+def reply_messages(reply_token: str, messages: list):
+    url = "https://api.line.me/v2/bot/message/reply"
+    headers = {
+        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    data = {"replyToken": reply_token, "messages": messages}
+    resp = requests.post(url, headers=headers, json=data, timeout=15)
+
+    # IMPORTANT: show LINE errors in Render logs
+    if resp.status_code != 200:
+        print("LINE reply FAILED:", resp.status_code, resp.text[:500], flush=True)
+
+def reply_text(reply_token: str, text: str):
+    reply_messages(reply_token, [{"type": "text", "text": text}])
+
+def reason_menu_text() -> str:
+    # fallback menu (always works)
+    lines = [
+        "退職理由を選択してください（番号でもOK）:",
+        "1. 家庭の事情",
+        "2. 健康上の理由",
+        "3. 引っ越し",
+        "4. 学業・進学",
+        "5. 転職",
+        "6. その他",
+        "",
+        "Please choose the reason (you can type 1–6)."
+    ]
+    return "\n".join(lines)
+
+def reply_reason_quick(reply_token: str):
+    # Real quickReply buttons
+    items = []
+    for i, (jp, _) in enumerate(REASONS, start=1):
+        label = f"{i}.{jp}"
+        items.append({
+            "type": "action",
+            "action": {
+                "type": "message",
+                "label": label[:20],
+                "text": jp  # what gets sent back when tapped
+            }
+        })
+
+    msg = {
+        "type": "text",
+        "text": "退職理由を選択してください（ボタン or 番号1〜6）。\nPlease choose using buttons or type 1–6.",
+        "quickReply": {"items": items}
+    }
+
+    reply_messages(reply_token, [msg])
+
+    # If LINE rejected the quickReply payload, user still needs guidance:
+    # Send fallback menu (always works)
+    reply_text(reply_token, reason_menu_text())
+
+# =========================================================
 # Webhook
-# -------------------------------
+# =========================================================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -165,24 +208,27 @@ def webhook():
         user_text = (event.get("message", {}).get("text") or "").strip()
         reply_token = event.get("replyToken")
 
+        print("IN:", {"source": source_type, "user_id": user_id, "text": user_text}, flush=True)
+        print("STATE:", USER_STATE.get(user_id), flush=True)
+
         if not reply_token or not user_text:
             continue
 
-        # Group protection: only respond if starts with !hr
+        # Group protection
         if source_type != "user":
             if not user_text.lower().startswith("!hr"):
                 continue
             user_text = user_text[3:].strip()
 
-        # Cancel during active flow
-        if user_id and user_id in USER_STATE and is_cancel_word(user_text):
+        # Cancel
+        if user_id and is_cancel_trigger(user_text):
             USER_STATE.pop(user_id, None)
-            reply_text(reply_token, "キャンセルしました。\nCancelled.")
+            reply_text(reply_token, "申請をキャンセルしました。\n\nRequest cancelled.")
             continue
 
-        # ---- Start quitting flow ----
+        # Start
         if user_id and is_quit_trigger(user_text):
-            USER_STATE[user_id] = {"step": "Q_WAIT_STAFFID"}
+            USER_STATE[user_id] = {"step": "WAIT_STAFFID"}
             reply_text(
                 reply_token,
                 "退職日申請を開始します。\n社員番号（例：2338）を入力してください。\n\n"
@@ -190,125 +236,97 @@ def webhook():
             )
             continue
 
-        # ---- Continue quitting flow ----
+        # Flow
         if user_id and user_id in USER_STATE:
             st = USER_STATE[user_id]
             step = st.get("step")
 
-            if step == "Q_WAIT_STAFFID":
-                if not is_valid_staff_id(user_text):
+            if step == "WAIT_STAFFID":
+                staff_id = user_text
+                if not re.match(r"^\d{3,6}$", staff_id):
                     reply_text(reply_token, "社員番号の形式が正しくありません。例：2338\n\nStaff ID example: 2338")
                     continue
-                st["staff_id"] = user_text
-                st["step"] = "Q_WAIT_DATE"
-                reply_text(
-                    reply_token,
+
+                st["staff_id"] = staff_id
+                st["step"] = "WAIT_DATE"
+                reply_text(reply_token,
                     "退職希望日（最後の勤務日）を入力してください。\n形式：YYYY-MM-DD\n例：2026-03-31\n\n"
                     "Enter quitting date.\nFormat: YYYY-MM-DD (e.g., 2026-03-31)"
                 )
                 continue
 
-            if step == "Q_WAIT_DATE":
-                if not is_valid_iso_date(user_text):
-                    reply_text(reply_token, "日付形式が正しくありません。例：2026-03-31\n\nExample: 2026-03-31")
+            if step == "WAIT_DATE":
+                quitting_date = user_text
+                if not is_valid_iso_date(quitting_date):
+                    reply_text(reply_token, "日付の形式が正しくありません。例：2026-03-31\n\nInvalid date example: 2026-03-31")
                     continue
-                st["quitting_date"] = user_text
-                st["step"] = "Q_WAIT_REASON"
-                reply_text_quick(
-                    reply_token,
-                    "退職理由を選んでください（Choose a reason）",
-                    REASON_LABELS + ["キャンセル（Cancel）"]
-                )
+
+                st["quitting_date"] = quitting_date
+                st["step"] = "WAIT_REASON"
+
+                # THIS is where you previously had “nothing happened”
+                reply_reason_quick(reply_token)
                 continue
 
-            if step == "Q_WAIT_REASON":
-                if user_text == "キャンセル（Cancel）" or is_cancel_word(user_text):
-                    USER_STATE.pop(user_id, None)
-                    reply_text(reply_token, "キャンセルしました。\nCancelled.")
+            if step == "WAIT_REASON":
+                # Accept number OR JP reason text
+                reason = REASON_NUM_MAP.get(user_text) or user_text
+
+                if reason not in VALID_REASON_JP:
+                    # Re-show menu
+                    reply_reason_quick(reply_token)
                     continue
 
-                if user_text not in REASON_MAP:
-                    reply_text(reply_token, "ボタンから選択してください。\nPlease choose using the buttons.")
-                    continue
+                st["reason"] = reason
 
-                st["reason"] = REASON_MAP[user_text]
-
-                # If Other → ask optional comment
-                if st["reason"] == "Other":
-                    st["step"] = "Q_WAIT_COMMENT"
-                    reply_text(
-                        reply_token,
-                        "補足コメントがあれば入力してください（なければ「なし」）。\n\n"
-                        "Optional comment (or type 'none')."
+                if reason == "その他":
+                    st["step"] = "WAIT_COMMENT"
+                    reply_text(reply_token,
+                        "『その他』を選択しました。簡単に理由を入力してください。\n\n"
+                        "You chose 'Other'. Please type a short reason."
                     )
-                else:
-                    st["comment"] = ""
-                    st["step"] = "Q_CONFIRM"
-                    reply_text_quick(
-                        reply_token,
-                        f"以下で申請します。\nStaffID: {st['staff_id']}\n退職日: {st['quitting_date']}\n理由: {st['reason']}\n\n送信しますか？",
-                        ["送信（Submit）", "キャンセル（Cancel）"]
-                    )
-                continue
+                    continue
 
-            if step == "Q_WAIT_COMMENT":
-                comment = user_text.strip()
-                if comment.lower() in ["none", "なし", "無し", "no"]:
-                    comment = ""
-                st["comment"] = comment
-                st["step"] = "Q_CONFIRM"
-                reply_text_quick(
-                    reply_token,
-                    f"以下で申請します。\nStaffID: {st['staff_id']}\n退職日: {st['quitting_date']}\n理由: {st['reason']}\nコメント: {st['comment'] or '(なし)'}\n\n送信しますか？",
-                    ["送信（Submit）", "キャンセル（Cancel）"]
+                # Submit now
+                result = call_apps_script_quitting(
+                    line_user_id=user_id,
+                    staff_id=st.get("staff_id", ""),
+                    quitting_date=st.get("quitting_date", ""),
+                    reason=st.get("reason", ""),
+                    comment=""
                 )
-                continue
-
-            if step == "Q_CONFIRM":
-                if user_text == "キャンセル（Cancel）" or is_cancel_word(user_text):
-                    USER_STATE.pop(user_id, None)
-                    reply_text(reply_token, "キャンセルしました。\nCancelled.")
-                    continue
-                if user_text != "送信（Submit）":
-                    reply_text(reply_token, "ボタンから選択してください。\nPlease choose using the buttons.")
-                    continue
-
-                payload = {
-                    "action": "createQuittingRequest",
-                    "lineUserId": user_id,
-                    "staffId": st.get("staff_id", ""),
-                    "quittingDate": st.get("quitting_date", ""),
-                    "reason": st.get("reason", ""),
-                    "comment": st.get("comment", ""),
-                }
-                result = call_apps_script(payload)
                 USER_STATE.pop(user_id, None)
 
                 if result.get("ok"):
-                    rid = result.get("requestId", "")
-                    reply_text(
-                        reply_token,
-                        f"申請を受け付けました。HRよりご連絡します。\n受付番号: {rid}\n\n"
-                        "Your request has been received. HR will review and contact you."
-                    )
+                    reply_text(reply_token, "申請を受け付けました。HRよりご連絡します。\n\nRequest received. HR will contact you.")
                 else:
-                    print("Quitting error:", result, flush=True)
-                    reply_text(
-                        reply_token,
-                        "システム登録でエラーが発生しました。HRへご連絡ください。\n\n"
-                        "System error saving it. Please contact HR."
-                    )
+                    reply_text(reply_token, "申請は受け付けましたが、登録でエラー。HRへご連絡ください。\n\nSystem error. Please contact HR.")
                 continue
 
-        # ---- FAQ fallback ----
+            if step == "WAIT_COMMENT":
+                comment = user_text[:300]
+                result = call_apps_script_quitting(
+                    line_user_id=user_id,
+                    staff_id=st.get("staff_id", ""),
+                    quitting_date=st.get("quitting_date", ""),
+                    reason=st.get("reason", ""),
+                    comment=comment
+                )
+                USER_STATE.pop(user_id, None)
+
+                if result.get("ok"):
+                    reply_text(reply_token, "申請を受け付けました。HRよりご連絡します。\n\nRequest received. HR will contact you.")
+                else:
+                    reply_text(reply_token, "申請は受け付けましたが、登録でエラー。HRへご連絡ください。\n\nSystem error. Please contact HR.")
+                continue
+
+        # Default FAQ
         answer = find_faq(user_text)
         if answer:
             reply_text(reply_token, answer)
         else:
-            if detect_language(user_text) == "jp":
-                reply_text(reply_token, "申し訳ありません。その質問は人事に転送されました。")
-            else:
-                reply_text(reply_token, "Sorry, HR will follow up on this.")
+            reply_text(reply_token, "申し訳ありません。その質問は人事に転送されました。" if detect_language(user_text) == "jp"
+                       else "Sorry, HR will follow up on this.")
 
     return "OK"
 
